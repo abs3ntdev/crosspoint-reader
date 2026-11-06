@@ -184,6 +184,11 @@ that particular sleep should tolerate or ignore the late retry, e.g. by checking
 `{event.ts}`). Other events already queued for the same plugin (`reader.exit` and
 friends) ride along in the sleep-time drain.
 
+The built-in **Sync on Sleep** progress push (sync settings) shares this same
+WiFi join and runs just before the plugin drain, so a plugin progress handler
+and the built-in push can both run on one sleep. Enable only one of them for
+the same server.
+
 Auth reuses the catalog vocabulary from the same `device.json`: `{token}` is
 read from the declared token file, and on a 401/403 a `"password"`-type auth
 section mints a fresh token and retries once — same behavior as catalog
