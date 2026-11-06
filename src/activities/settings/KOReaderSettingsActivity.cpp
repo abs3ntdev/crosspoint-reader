@@ -148,6 +148,7 @@ void KOReaderSettingsActivity::activateIndex(const int index) {
     KOREADER_STORE.saveToFile();
     requestUpdate();
   } else if (index == IDX_SYNC_ON_SLEEP) {
+    if (KOREADER_STORE.getSyncBehavior() != KOReaderSyncBehavior::SMART) return;
     KOREADER_STORE.setSyncOnSleep(!KOREADER_STORE.getSyncOnSleep());
     KOREADER_STORE.saveToFile();
     requestUpdate();
@@ -199,8 +200,14 @@ void KOReaderSettingsActivity::buildScreen(UiScreen& screen) {
     } else if (i == IDX_MATCH_METHOD) {
       rowValues_[i] =
           KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME ? tr(STR_FILENAME) : tr(STR_BINARY);
-    } else if (i == IDX_SEND_METADATA || i == IDX_SYNC_CLIPPINGS || i == IDX_SYNC_ON_SLEEP) {
+    } else if (i == IDX_SEND_METADATA || i == IDX_SYNC_CLIPPINGS) {
       rowValues_[i].clear();
+    } else if (i == IDX_SYNC_ON_SLEEP) {
+      if (KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART) {
+        rowValues_[i].clear();
+      } else {
+        rowValues_[i] = std::string("[") + tr(STR_SYNC_REQUIRES_SMART) + "]";
+      }
     } else if (i == IDX_SYNC_BEHAVIOR) {
       rowValues_[i] =
           KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART ? tr(STR_SMART_SYNC) : tr(STR_ASK_EVERY_TIME);
@@ -211,7 +218,11 @@ void KOReaderSettingsActivity::buildScreen(UiScreen& screen) {
   }
   GUI.setCheckboxRow(rowItems_[IDX_SEND_METADATA], KOREADER_STORE.getSendMetadata());
   GUI.setCheckboxRow(rowItems_[IDX_SYNC_CLIPPINGS], KOREADER_STORE.getSyncClippings());
-  GUI.setCheckboxRow(rowItems_[IDX_SYNC_ON_SLEEP], KOREADER_STORE.getSyncOnSleep());
+  if (KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART) {
+    GUI.setCheckboxRow(rowItems_[IDX_SYNC_ON_SLEEP], KOREADER_STORE.getSyncOnSleep());
+  } else {
+    rowItems_[IDX_SYNC_ON_SLEEP].toggle = false;  // the hint replaces the checkbox
+  }
 
   fui::ListProps props;
   props.items = rowItems_;

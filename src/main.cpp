@@ -42,7 +42,7 @@
 #include "WifiCredentialStore.h"
 #include "activities/Activity.h"
 #include "activities/ActivityManager.h"
-#include "activities/reader/KOReaderProgressUpload.h"
+#include "activities/reader/KOReaderSyncSession.h"
 #include "activities/settings/SdFirmwareUpdateActivity.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
@@ -400,12 +400,11 @@ static void deliverSleepPluginEvents(const bool allowNetwork) {
   }
   pluginevents::emit(pluginevents::Event::SleepEnter, vars, varCount);
   if (!allowNetwork) {
-    koreaderUpload::push(renderer);  // drops the capture without WiFi
+    sleepSync::skip(renderer, tr(STR_WIFI_CONN_FAILED));
     return;
   }
   if (WiFi.status() == WL_CONNECTED) {
-    if (koreaderUpload::pending()) GUI.drawPopup(renderer, tr(STR_SYNCING_ON_SLEEP));
-    koreaderUpload::push(renderer);
+    sleepSync::run(renderer);
     pluginevents::drain(&renderer);
     return;
   }
@@ -413,18 +412,15 @@ static void deliverSleepPluginEvents(const bool allowNetwork) {
   // sleep.enter: reader.session is queued while reading and delivered on this
   // same sleep, and a progress-sync plugin usually subscribes to it alone.
   // Sync on Sleep (progress captured by the reader above) also justifies the join.
-  const bool syncPending = koreaderUpload::pending();
-  const auto skip = [] {
-    koreaderUpload::push(renderer);  // drops the capture without WiFi
-  };
-  if (!pluginevents::wantsConnectAny() && !syncPending) return skip();
-  if (powerManager.getBatteryPercentage() < 20) return skip();
+  const bool syncPending = sleepSync::pending();
+  if (!pluginevents::wantsConnectAny() && !syncPending) return;
+  if (powerManager.getBatteryPercentage() < 20) return sleepSync::skip(renderer, tr(STR_SYNC_BATTERY_LOW));
   // Sleep can be the first WiFi use since boot or deep-sleep wake.
   WIFI_STORE.loadFromFile();
   const auto cred = WIFI_STORE.findCredential(WIFI_STORE.getLastConnectedSsid());
-  if (!cred) return skip();
+  if (!cred) return sleepSync::skip(renderer, tr(STR_SYNC_NO_SAVED_WIFI));
 
-  GUI.drawPopup(renderer, syncPending ? tr(STR_SYNCING_ON_SLEEP) : tr(STR_LOADING_POPUP));
+  GUI.drawPopup(renderer, syncPending ? tr(STR_CONNECTING) : tr(STR_LOADING_POPUP));
   WiFi.mode(WIFI_STA);
   WiFi.begin(cred->ssid.c_str(), cred->password.c_str());
   const unsigned long joinDeadline = millis() + 10000;
@@ -433,10 +429,10 @@ static void deliverSleepPluginEvents(const bool allowNetwork) {
   }
   if (WiFi.status() == WL_CONNECTED) {
     trustedtime::startSync();  // snap the clock floor while the network is up
-    koreaderUpload::push(renderer);
+    sleepSync::run(renderer);
     pluginevents::drain(&renderer);
   } else {
-    koreaderUpload::push(renderer);
+    sleepSync::skip(renderer, tr(STR_WIFI_CONN_FAILED));
     LOG_DBG("MAIN", "Sleep-event WiFi join timed out; deferring delivery");
   }
 }

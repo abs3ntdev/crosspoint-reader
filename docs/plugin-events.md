@@ -184,7 +184,7 @@ that particular sleep should tolerate or ignore the late retry, e.g. by checking
 `{event.ts}`). Other events already queued for the same plugin (`reader.exit` and
 friends) ride along in the sleep-time drain.
 
-The built-in **Sync on Sleep** progress push (sync settings) shares this same
+The built-in **Sync on Sleep** smart sync (sync settings) shares this same
 WiFi join and runs just before the plugin drain, so a plugin progress handler
 and the built-in push can both run on one sleep. Enable only one of them for
 the same server.

@@ -6,6 +6,7 @@
 #include <optional>
 
 #include "KOReaderSyncClient.h"
+#include "KOReaderSyncSession.h"
 #include "ProgressMapper.h"
 #include "activities/Activity.h"
 #include "components/UiAppHost.h"
@@ -46,22 +47,11 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
     NO_CREDENTIALS
   };
 
-  std::shared_ptr<Epub> epub;  // null until lazy-loaded after TLS in performSync()
-  std::string epubPath;
   std::string localChapterName;
-  CrossPointPosition localPosition;
-
   State state = WIFI_SELECTION;
   std::string statusMessage;
-  std::string documentHash;
-
-  // Remote progress data
-  bool hasRemoteProgress = false;
-  KOReaderProgress remoteProgress;
-  CrossPointPosition remotePosition;
-
-  // Local progress as KOReader format (pre-computed before Epub was released)
-  SavedProgressPosition localProgress;
+  // Book, local/remote progress and document hash shared with Sync on Sleep.
+  koreaderSync::Session sync;
 
   // Selection in result screen (0=Apply, 1=Upload)
   int selectedOption = 0;
@@ -86,8 +76,7 @@ class KOReaderSyncActivity final : public Activity, private UiAppHost {
   bool smartSyncEnabled() const;
   void markAutoReturn();
   void completeAlreadySynced();
-  void ensureEpubLoaded();
-  void saveProgressAndReturn(int spineIndex, int page);
+  void saveProgressAndReturn();
   void returnToReader();
 
   // The UiAppHost app hosts the interactive states (SHOWING_RESULT compare

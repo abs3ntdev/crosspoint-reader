@@ -15,7 +15,7 @@
 #include "EpubReaderUtils.h"
 #include "KOReaderCredentialStore.h"
 #include "KOReaderDocumentId.h"
-#include "KOReaderProgressUpload.h"
+#include "KOReaderSyncSession.h"
 #include "MappedInputManager.h"
 #include "ProgressComparison.h"
 #include "ReaderUtils.h"
@@ -38,19 +38,6 @@ namespace {
 // disambiguates them in the handler.
 constexpr fui::ActionId ACTION_ROW = 1;
 
-std::string calculateDocumentHashForMethod(const std::string& path, const DocumentMatchMethod method) {
-  return method == DocumentMatchMethod::FILENAME ? KOReaderDocumentId::calculateFromFilename(path)
-                                                 : KOReaderDocumentId::calculate(path);
-}
-
-DocumentMatchMethod alternateMatchMethod(const DocumentMatchMethod method) {
-  return method == DocumentMatchMethod::FILENAME ? DocumentMatchMethod::BINARY : DocumentMatchMethod::FILENAME;
-}
-
-const char* matchMethodName(const DocumentMatchMethod method) {
-  return method == DocumentMatchMethod::FILENAME ? "filename" : "binary";
-}
-
 }  // namespace
 
 KOReaderSyncActivity::KOReaderSyncActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
@@ -59,38 +46,15 @@ KOReaderSyncActivity::KOReaderSyncActivity(GfxRenderer& renderer, MappedInputMan
                                            const bool pluginEventsOnly)
     : Activity("KOReaderSync", renderer, mappedInput),
       UiAppHost(renderer),
-      epubPath(epubPath),
       localChapterName(std::move(localChapterName)),
-      localPosition(localPosition),
-      remoteProgress{},
-      remotePosition{},
-      localProgress(std::move(localKoPos)),
-      pluginEventsOnly(pluginEventsOnly) {}
-
-void KOReaderSyncActivity::ensureEpubLoaded() {
-  if (!epub) {
-    LOG_DBG("KOSync", "Loading epub for progress mapping (heap: %u)", (unsigned)ESP.getFreeHeap());
-    epub = std::make_shared<Epub>(epubPath, "/.crosspoint");
-    epub->setupCacheDir();
-    // Load metadata only (no CSS needed for progress mapping, don't rebuild if cache is missing).
-    if (!epub->load(false, true)) {
-      LOG_ERR("KOSync", "Failed to load epub for progress mapping");
-      epub.reset();
-      return;
-    }
-    LOG_DBG("KOSync", "Epub loaded (heap: %u)", (unsigned)ESP.getFreeHeap());
-  }
+      pluginEventsOnly(pluginEventsOnly) {
+  sync.epubPath = epubPath;
+  sync.localPosition = localPosition;
+  sync.localProgress = std::move(localKoPos);
 }
 
-void KOReaderSyncActivity::saveProgressAndReturn(int spineIndex, int page) {
-  // epub is guaranteed non-null here: ensureEpubLoaded() was called in performSync() before
-  // SHOWING_RESULT state is entered, and this method is only called from that state.
-  assert(epub);
-  std::optional<uint32_t> offset;
-  if (remotePosition.hasVisibleTextOffset && remotePosition.spineIndex == spineIndex) {
-    offset = remotePosition.visibleTextOffset;
-  }
-  if (!EpubReaderUtils::saveProgress(*epub, spineIndex, page, 0, offset)) {
+void KOReaderSyncActivity::saveProgressAndReturn() {
+  if (!koreaderSync::applyRemote(sync)) {
     {
       RenderLock lock(*this);
       state = SYNC_FAILED;
@@ -102,7 +66,7 @@ void KOReaderSyncActivity::saveProgressAndReturn(int spineIndex, int page) {
   returnToReader();
 }
 
-void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(epubPath); }
+void KOReaderSyncActivity::returnToReader() { activityManager.goToReader(sync.epubPath); }
 
 bool KOReaderSyncActivity::smartSyncEnabled() const {
   return KOREADER_STORE.getSyncBehavior() == KOReaderSyncBehavior::SMART;
@@ -159,188 +123,56 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
 }
 
 void KOReaderSyncActivity::performSync() {
-  WifiPowerSaveGuard psGuard;
-  const DocumentMatchMethod primaryMethod = KOREADER_STORE.getMatchMethod();
-  documentHash = calculateDocumentHashForMethod(epubPath, primaryMethod);
-  if (documentHash.empty()) {
+  const auto status = [](const char* message, void* user) {
+    auto* self = static_cast<KOReaderSyncActivity*>(user);
     {
-      RenderLock lock(*this);
-      state = SYNC_FAILED;
-      statusMessage = tr(STR_HASH_FAILED);
+      RenderLock lock(*self);
+      self->statusMessage = message;
     }
-    requestUpdate(true);
-    return;
-  }
-  const std::string primaryHash = documentHash;
-
-  LOG_DBG("KOSync", "Document hash (%s): %s", matchMethodName(primaryMethod), documentHash.c_str());
-
-  if (KOREADER_STORE.getSyncClippings()) {
-    {
-      RenderLock lock(*this);
-      statusMessage = tr(STR_SYNCING_CLIPPINGS);
-    }
-    requestUpdateAndWait();
-    bool clippingsSynced;
-    {
-#if defined(CONFIG_IDF_TARGET_ESP32C3) && CONFIG_IDF_TARGET_ESP32C3
-      RenderLock lock;
-      GfxRenderer::FrameBufferLoan loan(renderer);
-#endif
-      clippingsSynced = clippingSync::run(epubPath, documentHash);
-    }
-    if (!clippingsSynced) {
+    self->requestUpdateAndWait();
+  };
+  const bool smart = smartSyncEnabled();
+  using koreaderSync::Decision;
+  switch (koreaderSync::fetchAndCompare(sync, renderer, smart, status, this)) {
+    case Decision::Failed: {
       {
         RenderLock lock(*this);
         state = SYNC_FAILED;
-        statusMessage = tr(STR_CLIPPING_SYNC_FAILED);
+        statusMessage = sync.error;
       }
       requestUpdate(true);
       return;
     }
-  }
-
-  {
-    RenderLock lock(*this);
-    statusMessage = tr(STR_FETCH_PROGRESS);
-  }
-  requestUpdateAndWait();
-
-  // Fetch remote progress. In smart mode, retain the alternate document-id
-  // record until both records can be mapped after the Epub is reloaded.
-  auto result = KOReaderSyncClient::getProgress(documentHash, remoteProgress);
-  LOG_DBG("KOSync", "Primary remote (%s): result=%d http=%d doc=%s local=%.6f remote=%.6f xpath=%s",
-          matchMethodName(primaryMethod), result, KOReaderSyncClient::lastHttpCode, documentHash.c_str(),
-          localProgress.percentage, remoteProgress.percentage, remoteProgress.progress.c_str());
-
-  KOReaderProgress alternateProgress;
-  bool hasAlternateProgress = false;
-  if (smartSyncEnabled()) {
-    const DocumentMatchMethod altMethod = alternateMatchMethod(primaryMethod);
-    const std::string altHash = calculateDocumentHashForMethod(epubPath, altMethod);
-    if (!altHash.empty() && altHash != documentHash) {
-      KOReaderProgress altProgress;
-      const auto altResult = KOReaderSyncClient::getProgress(altHash, altProgress);
-      LOG_DBG("KOSync", "Alternate remote (%s): result=%d http=%d doc=%s local=%.6f remote=%.6f xpath=%s",
-              matchMethodName(altMethod), altResult, KOReaderSyncClient::lastHttpCode, altHash.c_str(),
-              localProgress.percentage, altProgress.percentage, altProgress.progress.c_str());
-
-      if (altResult == KOReaderSyncClient::OK) {
-        alternateProgress = std::move(altProgress);
-        hasAlternateProgress = true;
-      }
-    }
-  }
-
-  if (result == KOReaderSyncClient::NOT_FOUND && hasAlternateProgress) {
-    remoteProgress = std::move(alternateProgress);
-    hasAlternateProgress = false;
-    result = KOReaderSyncClient::OK;
-  }
-
-  if (result == KOReaderSyncClient::NOT_FOUND) {
-    if (smartSyncEnabled()) {
-      LOG_DBG("KOSync", "Smart sync: no remote progress found for known document hashes; uploading local %.6f",
-              localProgress.percentage);
-      performUpload();
-      return;
-    }
-
-    // No remote progress - offer to upload
-    {
-      RenderLock lock(*this);
-      state = NO_REMOTE_PROGRESS;
-      hasRemoteProgress = false;
-    }
-    requestUpdate(true);
-    return;
-  }
-
-  if (result != KOReaderSyncClient::OK) {
-    {
-      RenderLock lock(*this);
-      state = SYNC_FAILED;
-      statusMessage = KOReaderSyncClient::errorString(result);
-    }
-    requestUpdate(true);
-    return;
-  }
-
-  // Epub was released before sync to free RAM for the TLS handshake — reload it now.
-  hasRemoteProgress = true;
-  ensureEpubLoaded();
-  if (!epub) {
-    {
-      RenderLock lock(*this);
-      state = SYNC_FAILED;
-      statusMessage = "";
-    }
-    requestUpdate(true);
-    return;
-  }
-
-  {
-    RenderLock lock;
-    GfxRenderer::FrameBufferLoan loan(renderer);
-
-    const auto mapRemoteProgress = [&](const KOReaderProgress& progress) {
-      // The standard KOReader progress XPath is the authoritative content anchor.
-      // The CrossPoint server's existing rich page hints remain a legacy fallback.
-      const SavedProgressPosition koPos = {progress.progress, progress.percentage};
-      CrossPointPosition mapped =
-          ProgressMapper::toCrossPoint(epub, koPos, renderer, localPosition.spineIndex, localPosition.totalPages);
-      if (!mapped.hasVisibleTextOffset && progress.position.has_value()) {
-        // toCrossPoint above already tried koPos.xpath; if the rich position carries the same XPath,
-        // tell fromRichPosition to skip re-resolving it and use its page hints directly.
-        const bool sameXPath = progress.position->xpath == progress.progress;
-        if (const auto richMapped = ProgressMapper::fromRichPosition(epub, *progress.position, renderer, sameXPath)) {
-          mapped = *richMapped;
-        }
-      }
-      return mapped;
-    };
-
-    remotePosition = mapRemoteProgress(remoteProgress);
-    if (hasAlternateProgress) {
-      const CrossPointPosition alternatePosition = mapRemoteProgress(alternateProgress);
-      if (selectRemoteRecord(remotePosition, remoteProgress.percentage, alternatePosition,
-                             alternateProgress.percentage) == RemoteRecordChoice::Alternate) {
-        remoteProgress = std::move(alternateProgress);
-        remotePosition = alternatePosition;
-        LOG_DBG("KOSync", "Selected alternate remote record after mapped-position comparison");
-      } else {
-        LOG_DBG("KOSync", "Kept primary remote record after mapped-position comparison");
-      }
-    }
-  }
-
-  const ProgressComparison comparison =
-      compareProgress(localPosition, localProgress.percentage, remotePosition, remoteProgress.percentage);
-  if (smartSyncEnabled()) {
-    LOG_DBG("KOSync", "Smart decision: doc=%s result=%d local=%.6f remote=%.6f remoteXpath=%s mapped=%d/%d",
-            primaryHash.c_str(), static_cast<int>(comparison), localProgress.percentage, remoteProgress.percentage,
-            remoteProgress.progress.c_str(), remotePosition.spineIndex, remotePosition.pageNumber);
-    switch (comparison) {
-      case ProgressComparison::Synchronized:
-        completeAlreadySynced();
-        return;
-      case ProgressComparison::LocalAhead:
+    case Decision::NoRemote:
+      if (smart) {
+        LOG_DBG("KOSync", "Smart sync: no remote progress found; uploading local %.6f", sync.localProgress.percentage);
         performUpload();
         return;
-      case ProgressComparison::RemoteAhead:
-        saveProgressAndReturn(remotePosition.spineIndex, remotePosition.pageNumber);
-        return;
-      case ProgressComparison::Unknown:
-        LOG_DBG("KOSync", "Smart sync comparison unknown; opening manual selection");
-        break;
-    }
+      }
+      {
+        RenderLock lock(*this);
+        state = NO_REMOTE_PROGRESS;
+      }
+      requestUpdate(true);
+      return;
+    case Decision::Synchronized:
+      completeAlreadySynced();
+      return;
+    case Decision::LocalAhead:
+      performUpload();
+      return;
+    case Decision::RemoteAhead:
+      saveProgressAndReturn();
+      return;
+    case Decision::NeedsChoice:
+      break;
   }
 
-  // localProgress was pre-computed in EpubReaderActivity before the Epub was released.
+  const ProgressComparison comparison = compareProgress(sync.localPosition, sync.localProgress.percentage,
+                                                        sync.remotePosition, sync.remoteProgress.percentage);
   {
     RenderLock lock(*this);
     state = SHOWING_RESULT;
-
     selectedOption = comparison == ProgressComparison::LocalAhead ? 1 : 0;
   }
   requestUpdate(true);
@@ -354,22 +186,7 @@ void KOReaderSyncActivity::performUpload() {
   }
   requestUpdateAndWait();
 
-  // localProgress was pre-computed in EpubReaderActivity before the Epub was released.
-  // Metadata needs the Epub; on the NO_REMOTE_PROGRESS path it is still null.
-  if (KOREADER_STORE.getSendMetadata()) ensureEpubLoaded();
-  const KOReaderProgress progress =
-      koreaderUpload::build(epubPath, documentHash, localPosition, localProgress, epub.get());
-
-  // Release the Epub before the network call so the TLS handshake has enough free heap
-  // (consistent with the release-before-sync pattern in performSync); nothing below needs it.
-  epub.reset();
-
-  KOReaderSyncClient::Error result;
-  {
-    // Restore power-save before esp_wifi_stop below; set_ps on a stopped radio fails.
-    WifiPowerSaveGuard psGuard;
-    result = KOReaderSyncClient::updateProgress(progress);
-  }
+  const KOReaderSyncClient::Error result = koreaderSync::upload(sync);
 
   // Drop the radio while user reads the result; full teardown happens at silent reboot.
   esp_wifi_stop();
@@ -435,20 +252,13 @@ void KOReaderSyncActivity::onExit() {
 
 void KOReaderSyncActivity::chooseResultOption() {
   if (selectedOption == 0) {
-    saveProgressAndReturn(remotePosition.spineIndex, remotePosition.pageNumber);
+    saveProgressAndReturn();
   } else {
     performUpload();
   }
 }
 
-void KOReaderSyncActivity::startUpload() {
-  if (documentHash.empty()) {
-    documentHash = KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME
-                       ? KOReaderDocumentId::calculateFromFilename(epubPath)
-                       : KOReaderDocumentId::calculate(epubPath);
-  }
-  performUpload();
-}
+void KOReaderSyncActivity::startUpload() { performUpload(); }
 
 void KOReaderSyncActivity::onResultRow(const fui::ActionEvent& event, void* user) {
   auto* self = static_cast<KOReaderSyncActivity*>(user);
@@ -480,28 +290,29 @@ void KOReaderSyncActivity::buildResultScreen(UiScreen& screen) {
   if (state == SHOWING_RESULT) {
     // Chapter names (remote requires the lazily-loaded Epub; local was
     // pre-computed before the Epub was released).
-    const int remoteTocIndex = epub->getTocIndexForSpineIndex(remotePosition.spineIndex);
+    const int remoteTocIndex = sync.epub->getTocIndexForSpineIndex(sync.remotePosition.spineIndex);
     const std::string remoteChapter =
-        (remoteTocIndex >= 0) ? epub->getTocItem(remoteTocIndex).title
-                              : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(remotePosition.spineIndex + 1));
+        (remoteTocIndex >= 0)
+            ? sync.epub->getTocItem(remoteTocIndex).title
+            : (std::string(tr(STR_SECTION_PREFIX)) + std::to_string(sync.remotePosition.spineIndex + 1));
     char localChapterFallback[32];
     const char* localChapter = localChapterName.c_str();
     if (localChapterName.empty()) {
       snprintf(localChapterFallback, sizeof(localChapterFallback), "%s%d", tr(STR_SECTION_PREFIX),
-               localPosition.spineIndex + 1);
+               sync.localPosition.spineIndex + 1);
       localChapter = localChapterFallback;
     }
 
     char remoteVal[64];
-    snprintf(remoteVal, sizeof(remoteVal), tr(STR_PAGE_OVERALL_FORMAT), remotePosition.pageNumber + 1,
-             remoteProgress.percentage * 100);
+    snprintf(remoteVal, sizeof(remoteVal), tr(STR_PAGE_OVERALL_FORMAT), sync.remotePosition.pageNumber + 1,
+             sync.remoteProgress.percentage * 100);
     char localVal[64];
-    snprintf(localVal, sizeof(localVal), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), localPosition.pageNumber + 1,
-             localPosition.totalPages, localProgress.percentage * 100);
+    snprintf(localVal, sizeof(localVal), tr(STR_PAGE_TOTAL_OVERALL_FORMAT), sync.localPosition.pageNumber + 1,
+             sync.localPosition.totalPages, sync.localProgress.percentage * 100);
     char deviceStr[80];
     deviceStr[0] = '\0';
-    if (!remoteProgress.device.empty()) {
-      snprintf(deviceStr, sizeof(deviceStr), tr(STR_DEVICE_FROM_FORMAT), remoteProgress.device.c_str());
+    if (!sync.remoteProgress.device.empty()) {
+      snprintf(deviceStr, sizeof(deviceStr), tr(STR_DEVICE_FROM_FORMAT), sync.remoteProgress.device.c_str());
     }
 
     // Labeled, multi-line comparison flowing from the top. Indent everything to

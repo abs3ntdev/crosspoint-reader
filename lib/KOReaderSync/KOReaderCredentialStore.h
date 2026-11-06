@@ -107,6 +107,10 @@ class KOReaderCredentialStore : public PersistableStore<KOReaderCredentialStore>
 
   void setSyncOnSleep(bool enabled) { syncOnSleep = enabled; }
   bool getSyncOnSleep() const { return syncOnSleep; }
+  // Sync on Sleep cannot ask, so it runs only with Smart sync and credentials.
+  bool syncOnSleepActive() const {
+    return syncOnSleep && syncBehavior == KOReaderSyncBehavior::SMART && hasCredentials();
+  }
 
   // Sync behavior
   void setSyncBehavior(KOReaderSyncBehavior behavior);

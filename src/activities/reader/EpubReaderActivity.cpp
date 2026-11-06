@@ -38,8 +38,8 @@
 #include "EpubReaderPercentSelectionActivity.h"
 #include "EpubReaderUtils.h"
 #include "KOReaderCredentialStore.h"
-#include "KOReaderProgressUpload.h"
 #include "KOReaderSyncActivity.h"
+#include "KOReaderSyncSession.h"
 #include "MappedInputManager.h"
 #include "ProgressMapper.h"
 #include "QrDisplayActivity.h"
@@ -3412,7 +3412,7 @@ void EpubReaderActivity::updateBookmarkFlag() {
 void EpubReaderActivity::prepareForSleep() {
   ReaderActivity::prepareForSleep();
   // Capture now: the reader is torn down after the sleep drain. Caller holds the render lock.
-  if (!epub || !KOREADER_STORE.getSyncOnSleep() || !KOREADER_STORE.hasCredentials()) return;
+  if (!epub || !KOREADER_STORE.syncOnSleepActive()) return;
   const CrossPointPosition localPos = getCurrentPosition();
   SavedProgressPosition localKoPos;
   {
@@ -3420,7 +3420,7 @@ void EpubReaderActivity::prepareForSleep() {
     GfxRenderer::FrameBufferLoan loan(renderer);
     localKoPos = ProgressMapper::toSavedProgress(epub, localPos);
   }
-  koreaderUpload::capture(epub->getPath(), localPos, localKoPos, epub.get());
+  sleepSync::capture(epub, localPos, localKoPos);
 }
 
 ScreenshotInfo EpubReaderActivity::getScreenshotInfo() const {
